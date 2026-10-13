@@ -44,7 +44,7 @@ jobs:
       - name: Build AppImage and Binary
         working-directory: linux-rust
         run: |
-          cargo build --release --verbose
+          cargo build --release --features mic --verbose
           just
           mkdir -p dist
           cp target/release/librepods dist/librepods
