@@ -7,20 +7,35 @@ use pw::properties::properties;
 use pw::spa;
 use spa::pod::Pod;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
-/// Upper bound on buffered audio. Anything older is dropped rather than played
-/// late: a microphone that lags behind is worse than one that skips.
-const MAX_QUEUED_SAMPLES: usize = 64_000 / 2; // ~0.5 s at the presentation rate
+/// Upper bound on buffered audio, in milliseconds. Enough to absorb Bluetooth
+/// jitter, small enough to be imperceptible. Anything older is dropped rather
+/// than played late: a microphone that lags behind is worse than one that skips.
+const MAX_QUEUED_MS: usize = 60;
+
+/// PipeWire scheduling quantum requested for the node, in milliseconds.
+const NODE_QUANTUM_MS: u32 = 20;
 
 enum Command {
     Quit,
 }
 
+/// State shared between the decoder thread and the PipeWire thread.
+struct Shared {
+    queue: Mutex<VecDeque<i16>>,
+    /// True only while an application is actually recording from the node.
+    /// While false, audio is discarded instead of queued, so the first read
+    /// never starts with a backlog of stale samples.
+    streaming: AtomicBool,
+}
+
 pub struct MicSource {
-    samples: Arc<Mutex<VecDeque<i16>>>,
+    shared: Arc<Shared>,
+    max_queued: usize,
     sender: pw::channel::Sender<Command>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -28,20 +43,25 @@ pub struct MicSource {
 impl MicSource {
     /// Starts the PipeWire node on its own thread.
     pub fn start(rate: u32, channels: u32) -> std::io::Result<Self> {
-        let samples = Arc::new(Mutex::new(VecDeque::new()));
+        let shared = Arc::new(Shared {
+            queue: Mutex::new(VecDeque::new()),
+            streaming: AtomicBool::new(false),
+        });
+        let max_queued = rate as usize * channels as usize * MAX_QUEUED_MS / 1000;
         let (sender, receiver) = pw::channel::channel();
 
-        let queue = Arc::clone(&samples);
+        let state = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("librepods-mic".into())
             .spawn(move || {
-                if let Err(e) = run(queue, receiver, rate, channels) {
+                if let Err(e) = run(state, receiver, rate, channels) {
                     error!("Microphone source stopped: {e}");
                 }
             })?;
 
         Ok(Self {
-            samples,
+            shared,
+            max_queued,
             sender,
             thread: Some(thread),
         })
@@ -49,15 +69,18 @@ impl MicSource {
 
     /// Queues decoded samples for delivery to whoever is recording.
     pub fn push(&self, pcm: &[i16]) {
-        let Ok(mut queue) = self.samples.lock() else {
+        if !self.shared.streaming.load(Ordering::Acquire) {
+            return;
+        }
+        let Ok(mut queue) = self.shared.queue.lock() else {
             return;
         };
         queue.extend(pcm.iter().copied());
-        if queue.len() > MAX_QUEUED_SAMPLES {
-            // Nothing is recording, or the reader fell behind. Dropping the
-            // oldest audio keeps latency bounded; logging every overflow would
-            // flood the log at 130 frames a second.
-            let excess = queue.len() - MAX_QUEUED_SAMPLES;
+        if queue.len() > self.max_queued {
+            // The reader fell behind. Dropping the oldest audio keeps latency
+            // bounded; logging every overflow would flood the log at 130
+            // frames a second.
+            let excess = queue.len() - self.max_queued;
             queue.drain(..excess);
         }
     }
@@ -74,7 +97,7 @@ impl Drop for MicSource {
 }
 
 fn run(
-    samples: Arc<Mutex<VecDeque<i16>>>,
+    shared: Arc<Shared>,
     receiver: pw::channel::Receiver<Command>,
     rate: u32,
     channels: u32,
@@ -85,6 +108,7 @@ fn run(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
+    let latency = format!("{}/{}", rate * NODE_QUANTUM_MS / 1000, rate);
     let stream = pw::stream::StreamBox::new(
         &core,
         "librepods-mic",
@@ -95,13 +119,30 @@ fn run(
             *pw::keys::MEDIA_CLASS => "Audio/Source",
             *pw::keys::NODE_NAME => "librepods_mic",
             *pw::keys::NODE_DESCRIPTION => "AirPods Microphone (LibrePods)",
+            // Small quantum so PipeWire does not add its own buffering.
+            *pw::keys::NODE_LATENCY => latency.as_str(),
         },
     )?;
 
     let stride = SAMPLE_SIZE * channels as usize;
     let _listener = stream
-        .add_local_listener_with_user_data(samples)
-        .process(move |stream, samples| {
+        .add_local_listener_with_user_data(shared)
+        .state_changed(|_, shared, _old, new| {
+            let streaming = matches!(new, pw::stream::StreamState::Streaming);
+            if streaming {
+                // Start from empty so the first read is live audio.
+                if let Ok(mut queue) = shared.queue.lock() {
+                    queue.clear();
+                }
+            }
+            shared.streaming.store(streaming, Ordering::Release);
+            if !streaming {
+                if let Ok(mut queue) = shared.queue.lock() {
+                    queue.clear();
+                }
+            }
+        })
+        .process(move |stream, shared| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
@@ -112,7 +153,7 @@ fn run(
 
             let wanted = slice.len() / SAMPLE_SIZE;
             let mut written = 0;
-            if let Ok(mut queue) = samples.lock() {
+            if let Ok(mut queue) = shared.queue.lock() {
                 while written < wanted {
                     let Some(sample) = queue.pop_front() else {
                         break;
