@@ -1,43 +1,125 @@
 //! Publishes decoded AirPods microphone audio as a PipeWire source, so any
 //! application can record from it while playback stays on A2DP.
+//!
+//! Tuning knobs live in `~/.config/librepods/mic.conf` (or
+//! `$XDG_CONFIG_HOME/librepods/mic.conf`) and are re-read about once a second,
+//! so they can be changed while the app is running:
+//!
+//!   max_queue_ms = 200   # hard cap on buffered audio; older audio is dropped
+//!   prebuffer_ms = 60    # audio collected before playback (re)starts
+//!   gain         = 3.0   # linear volume multiplier, clipped at full scale
 
-use log::{error, info};
+use log::{error, info, warn};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
 use spa::pod::Pod;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime};
 
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
-/// Upper bound on buffered audio, in milliseconds. Enough to absorb Bluetooth
-/// jitter, small enough to be imperceptible. Anything older is dropped rather
-/// than played late: a microphone that lags behind is worse than one that skips.
-const MAX_QUEUED_MS: usize = 60;
+const DEFAULT_MAX_QUEUE_MS: u32 = 200;
+const DEFAULT_PREBUFFER_MS: u32 = 60;
+const DEFAULT_GAIN_MILLI: u32 = 3000;
 
-/// PipeWire scheduling quantum requested for the node, in milliseconds.
-const NODE_QUANTUM_MS: u32 = 20;
+/// PipeWire scheduling quantum, in ms. Override with LIBREPODS_MIC_QUANTUM_MS
+/// (read once when the node is created).
+const DEFAULT_QUANTUM_MS: u32 = 20;
+
+const DEFAULT_CONFIG: &str = "# LibrePods microphone tuning. Re-read about once a second.\n\
+# Keep max_queue_ms at least twice prebuffer_ms.\n\
+#\n\
+# Hard cap on buffered audio. Raise it if the log shows many overruns.\n\
+max_queue_ms = 200\n\
+# Audio collected before playback starts or resumes after a gap.\n\
+# Higher = fewer dropouts, more delay.\n\
+prebuffer_ms = 60\n\
+# Linear volume multiplier (1.0 = unchanged).\n\
+gain = 3.0\n";
 
 enum Command {
     Quit,
+}
+
+struct Tuning {
+    max_queue_ms: AtomicU32,
+    prebuffer_ms: AtomicU32,
+    gain_milli: AtomicU32,
 }
 
 /// State shared between the decoder thread and the PipeWire thread.
 struct Shared {
     queue: Mutex<VecDeque<i16>>,
     /// True only while an application is actually recording from the node.
-    /// While false, audio is discarded instead of queued, so the first read
-    /// never starts with a backlog of stale samples.
     streaming: AtomicBool,
+    /// False while the jitter buffer is refilling after start or an underrun.
+    playing: AtomicBool,
+    tuning: Tuning,
+    /// Samples per second across all channels.
+    samples_per_sec: usize,
+    underruns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+struct Housekeeping {
+    path: Option<PathBuf>,
+    mtime: Option<SystemTime>,
+    last_check: Instant,
+    last_stats: Instant,
 }
 
 pub struct MicSource {
     shared: Arc<Shared>,
-    max_queued: usize,
+    housekeeping: Mutex<Housekeeping>,
     sender: pw::channel::Sender<Command>,
     thread: Option<std::thread::JoinHandle<()>>,
+}
+
+fn config_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("librepods").join("mic.conf"))
+}
+
+fn apply_config(tuning: &Tuning, text: &str) {
+    let mut max_ms = DEFAULT_MAX_QUEUE_MS;
+    let mut pre_ms = DEFAULT_PREBUFFER_MS;
+    let mut gain = DEFAULT_GAIN_MILLI as f64 / 1000.0;
+    for line in text.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        match key {
+            "max_queue_ms" => match value.parse::<u32>() {
+                Ok(v) => max_ms = v.clamp(20, 2000),
+                Err(_) => warn!("mic.conf: bad max_queue_ms {value:?}"),
+            },
+            "prebuffer_ms" => match value.parse::<u32>() {
+                Ok(v) => pre_ms = v.min(1000),
+                Err(_) => warn!("mic.conf: bad prebuffer_ms {value:?}"),
+            },
+            "gain" => match value.parse::<f64>() {
+                Ok(v) => gain = v.clamp(0.1, 16.0),
+                Err(_) => warn!("mic.conf: bad gain {value:?}"),
+            },
+            other => warn!("mic.conf: unknown key {other:?}"),
+        }
+    }
+    pre_ms = pre_ms.min(max_ms);
+    tuning.max_queue_ms.store(max_ms, Ordering::Relaxed);
+    tuning.prebuffer_ms.store(pre_ms, Ordering::Relaxed);
+    tuning
+        .gain_milli
+        .store((gain * 1000.0).round() as u32, Ordering::Relaxed);
+    info!("Mic tuning: max_queue_ms={max_ms} prebuffer_ms={pre_ms} gain={gain:.2}");
 }
 
 impl MicSource {
@@ -46,10 +128,37 @@ impl MicSource {
         let shared = Arc::new(Shared {
             queue: Mutex::new(VecDeque::new()),
             streaming: AtomicBool::new(false),
+            playing: AtomicBool::new(false),
+            tuning: Tuning {
+                max_queue_ms: AtomicU32::new(DEFAULT_MAX_QUEUE_MS),
+                prebuffer_ms: AtomicU32::new(DEFAULT_PREBUFFER_MS),
+                gain_milli: AtomicU32::new(DEFAULT_GAIN_MILLI),
+            },
+            samples_per_sec: rate as usize * channels as usize,
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
         });
-        let max_queued = rate as usize * channels as usize * MAX_QUEUED_MS / 1000;
-        let (sender, receiver) = pw::channel::channel();
 
+        let path = config_path();
+        let mut mtime = None;
+        if let Some(p) = &path {
+            if !p.exists() {
+                if let Some(dir) = p.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let _ = std::fs::write(p, DEFAULT_CONFIG);
+            }
+            match std::fs::read_to_string(p) {
+                Ok(text) => {
+                    apply_config(&shared.tuning, &text);
+                    mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                }
+                Err(e) => warn!("Could not read {}: {e}", p.display()),
+            }
+            info!("Edit {} to tune the microphone live", p.display());
+        }
+
+        let (sender, receiver) = pw::channel::channel();
         let state = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("librepods-mic".into())
@@ -61,27 +170,67 @@ impl MicSource {
 
         Ok(Self {
             shared,
-            max_queued,
+            housekeeping: Mutex::new(Housekeeping {
+                path,
+                mtime,
+                last_check: Instant::now(),
+                last_stats: Instant::now(),
+            }),
             sender,
             thread: Some(thread),
         })
     }
 
+    /// Reloads the config file and logs buffer statistics. Called per push;
+    /// cheap because it only acts about once a second.
+    fn housekeeping(&self) {
+        let Ok(mut hk) = self.housekeeping.try_lock() else {
+            return;
+        };
+        if hk.last_check.elapsed() >= Duration::from_secs(1) {
+            hk.last_check = Instant::now();
+            if let Some(path) = hk.path.clone() {
+                let modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                if modified.is_some() && modified != hk.mtime {
+                    hk.mtime = modified;
+                    match std::fs::read_to_string(&path) {
+                        Ok(text) => apply_config(&self.shared.tuning, &text),
+                        Err(e) => warn!("Could not read {}: {e}", path.display()),
+                    }
+                }
+            }
+        }
+        if hk.last_stats.elapsed() >= Duration::from_secs(2) {
+            hk.last_stats = Instant::now();
+            if self.shared.streaming.load(Ordering::Acquire) {
+                let queued = self.shared.queue.lock().map(|q| q.len()).unwrap_or(0);
+                let ms = queued * 1000 / self.shared.samples_per_sec.max(1);
+                let under = self.shared.underruns.swap(0, Ordering::Relaxed);
+                let over = self.shared.overruns.swap(0, Ordering::Relaxed);
+                info!("Mic buffer: {ms} ms queued, {under} underruns, {over} overruns (last 2 s)");
+            }
+        }
+    }
+
     /// Queues decoded samples for delivery to whoever is recording.
     pub fn push(&self, pcm: &[i16]) {
+        self.housekeeping();
         if !self.shared.streaming.load(Ordering::Acquire) {
             return;
         }
+        let max_samples = self.shared.samples_per_sec
+            * self.shared.tuning.max_queue_ms.load(Ordering::Relaxed) as usize
+            / 1000;
         let Ok(mut queue) = self.shared.queue.lock() else {
             return;
         };
         queue.extend(pcm.iter().copied());
-        if queue.len() > self.max_queued {
+        if queue.len() > max_samples {
             // The reader fell behind. Dropping the oldest audio keeps latency
-            // bounded; logging every overflow would flood the log at 130
-            // frames a second.
-            let excess = queue.len() - self.max_queued;
+            // bounded.
+            let excess = queue.len() - max_samples;
             queue.drain(..excess);
+            self.shared.overruns.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -108,7 +257,14 @@ fn run(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_rc(None)?;
 
-    let latency = format!("{}/{}", rate * NODE_QUANTUM_MS / 1000, rate);
+    let quantum_ms = std::env::var("LIBREPODS_MIC_QUANTUM_MS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|v| (1..=200).contains(v))
+        .unwrap_or(DEFAULT_QUANTUM_MS);
+    let latency = format!("{}/{}", rate * quantum_ms / 1000, rate);
+    info!("Mic node latency request: {latency}");
+
     let stream = pw::stream::StreamBox::new(
         &core,
         "librepods-mic",
@@ -119,51 +275,73 @@ fn run(
             *pw::keys::MEDIA_CLASS => "Audio/Source",
             *pw::keys::NODE_NAME => "librepods_mic",
             *pw::keys::NODE_DESCRIPTION => "AirPods Microphone (LibrePods)",
-            // Small quantum so PipeWire does not add its own buffering.
             *pw::keys::NODE_LATENCY => latency.as_str(),
         },
     )?;
 
     let stride = SAMPLE_SIZE * channels as usize;
+    let channel_count = channels as usize;
     let _listener = stream
         .add_local_listener_with_user_data(shared)
         .state_changed(|_, shared, _old, new| {
             let streaming = matches!(new, pw::stream::StreamState::Streaming);
-            if streaming {
-                // Start from empty so the first read is live audio.
-                if let Ok(mut queue) = shared.queue.lock() {
-                    queue.clear();
-                }
+            shared.playing.store(false, Ordering::Release);
+            if let Ok(mut queue) = shared.queue.lock() {
+                queue.clear();
             }
             shared.streaming.store(streaming, Ordering::Release);
-            if !streaming {
-                if let Ok(mut queue) = shared.queue.lock() {
-                    queue.clear();
-                }
-            }
         })
         .process(move |stream, shared| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
                 return;
             };
+            let requested = buffer.requested() as usize;
             let data = &mut buffer.datas_mut()[0];
             let Some(slice) = data.data() else {
                 return;
             };
 
-            let wanted = slice.len() / SAMPLE_SIZE;
+            // Fill only what the graph asked for this cycle, not the whole
+            // (possibly much larger) buffer, or every cycle underruns.
+            let max_frames = slice.len() / stride;
+            let frames = if requested > 0 {
+                requested.min(max_frames)
+            } else {
+                max_frames
+            };
+            let wanted = frames * channel_count;
+
+            let gain = shared.tuning.gain_milli.load(Ordering::Relaxed) as i64;
+            let prebuffer = shared.samples_per_sec
+                * shared.tuning.prebuffer_ms.load(Ordering::Relaxed) as usize
+                / 1000;
+
             let mut written = 0;
             if let Ok(mut queue) = shared.queue.lock() {
-                while written < wanted {
-                    let Some(sample) = queue.pop_front() else {
-                        break;
-                    };
-                    let start = written * SAMPLE_SIZE;
-                    slice[start..start + SAMPLE_SIZE].copy_from_slice(&sample.to_le_bytes());
-                    written += 1;
+                if !shared.playing.load(Ordering::Relaxed) && queue.len() >= prebuffer.max(wanted)
+                {
+                    shared.playing.store(true, Ordering::Relaxed);
+                }
+                if shared.playing.load(Ordering::Relaxed) {
+                    while written < wanted {
+                        let Some(sample) = queue.pop_front() else {
+                            break;
+                        };
+                        let amplified = (sample as i64 * gain / 1000)
+                            .clamp(i16::MIN as i64, i16::MAX as i64)
+                            as i16;
+                        let start = written * SAMPLE_SIZE;
+                        slice[start..start + SAMPLE_SIZE]
+                            .copy_from_slice(&amplified.to_le_bytes());
+                        written += 1;
+                    }
+                    if written < wanted {
+                        // Underrun: refill the jitter buffer before resuming.
+                        shared.playing.store(false, Ordering::Relaxed);
+                        shared.underruns.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
-            // Silence rather than stale audio when the buds fall behind.
             for i in written..wanted {
                 let start = i * SAMPLE_SIZE;
                 slice[start..start + SAMPLE_SIZE].copy_from_slice(&0i16.to_le_bytes());
