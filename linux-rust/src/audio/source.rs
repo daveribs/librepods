@@ -292,14 +292,24 @@ fn run(
             shared.streaming.store(streaming, Ordering::Release);
         })
         .process(move |stream, shared| {
-            let Some(mut buffer) = stream.dequeue_buffer() else {
+            // The safe Buffer wrapper does not expose how many frames the graph
+            // asked for this cycle, so use the raw pw_buffer. Every path below
+            // hands the buffer back with queue_raw_buffer.
+            let raw = unsafe { stream.dequeue_raw_buffer() };
+            if raw.is_null() {
                 return;
+            }
+            let (requested, spa_data) = unsafe {
+                let spa_buf = (*raw).buffer;
+                ((*raw).requested as usize, (*spa_buf).datas)
             };
-            let requested = buffer.requested() as usize;
-            let data = &mut buffer.datas_mut()[0];
-            let Some(slice) = data.data() else {
+            let ptr = unsafe { (*spa_data).data } as *mut u8;
+            if ptr.is_null() {
+                unsafe { stream.queue_raw_buffer(raw) };
                 return;
-            };
+            }
+            let max_bytes = unsafe { (*spa_data).maxsize } as usize;
+            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, max_bytes) };
 
             // Fill only what the graph asked for this cycle, not the whole
             // (possibly much larger) buffer, or every cycle underruns.
@@ -347,10 +357,13 @@ fn run(
                 slice[start..start + SAMPLE_SIZE].copy_from_slice(&0i16.to_le_bytes());
             }
 
-            let chunk = data.chunk_mut();
-            *chunk.offset_mut() = 0;
-            *chunk.stride_mut() = stride as _;
-            *chunk.size_mut() = (wanted * SAMPLE_SIZE) as _;
+            unsafe {
+                let chunk = (*spa_data).chunk;
+                (*chunk).offset = 0;
+                (*chunk).stride = stride as i32;
+                (*chunk).size = (wanted * SAMPLE_SIZE) as u32;
+                stream.queue_raw_buffer(raw);
+            }
         })
         .register()?;
 
