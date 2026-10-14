@@ -4,12 +4,20 @@ on:
   push:
     branches:
       - linux/rust
+      - feat/mic-stream
     tags:
       - 'linux-v*'
     paths:
       - 'linux-rust/**'
-      - '.github/workflows/linux-build.yml'
+      - '.github/workflows/ci-linux-rust.yml'
   workflow_dispatch:
+
+env:
+  # Microphone streaming is an opt-in cargo feature; the Justfile reads this.
+  LIBREPODS_FEATURES: mic
+  # Lets the AppImage tools run on the CI runner without FUSE.
+  APPIMAGE_EXTRACT_AND_RUN: 1
+  ARCH: x86_64
 
 jobs:
   build:
@@ -21,13 +29,17 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libdbus-1-dev libpulse-dev appstream just libfuse2
+          sudo apt-get install -y \
+            build-essential cmake clang libclang-dev pkg-config \
+            libdbus-1-dev libpulse-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            appstream just wget file desktop-file-utils
 
       - name: Install AppImage tools
         run: |
           wget -q https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage -O /usr/local/bin/appimagetool
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage -O /usr/local/bin/linuxdeploy
-          chmod +x /usr/local/bin/{appimagetool,linuxdeploy}
+          chmod +x /usr/local/bin/appimagetool /usr/local/bin/linuxdeploy
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -40,13 +52,13 @@ jobs:
             ~/.cargo/git
             linux-rust/target
           key: ${{ runner.os }}-cargo-${{ hashFiles('linux-rust/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Build AppImage and Binary
         working-directory: linux-rust
         run: |
-          cargo build --release --features mic --verbose
-          just
-          mkdir -p dist
+          just build-appimage
           cp target/release/librepods dist/librepods
           mv dist/LibrePods-x86_64.AppImage dist/librepods-x86_64.AppImage
 

@@ -4,8 +4,9 @@ ICON_FILE := "assets/icon.png"
 
 default: build-appimage
 
+# Set LIBREPODS_FEATURES=mic to include microphone streaming.
 build:
-    cargo build --release
+    cargo build --release ${LIBREPODS_FEATURES:+--features "$LIBREPODS_FEATURES"}
 
 prepare:
     #!/usr/bin/env bash
@@ -36,11 +37,13 @@ bundle:
     set -euo pipefail
     tmpdir="$(cat .appdir_path)"
 
+    # PipeWire is left to the host: its SPA plugins must match the running daemon.
     linuxdeploy \
         --appdir "$tmpdir" \
         --executable "$tmpdir/usr/bin/{{APP_NAME}}" \
         --desktop-file "$tmpdir/{{APP_NAME}}.desktop" \
-        --icon-file "$tmpdir/usr/share/icons/hicolor/256x256/apps/me.kavishdevar.librepods.png"
+        --icon-file "$tmpdir/usr/share/icons/hicolor/256x256/apps/me.kavishdevar.librepods.png" \
+        --exclude-library "libpipewire-0.3.so*"
 
 build-appimage: build prepare bundle
     #!/usr/bin/env bash
