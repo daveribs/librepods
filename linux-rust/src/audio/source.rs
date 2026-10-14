@@ -1,15 +1,17 @@
 //! Publishes decoded AirPods microphone audio as a PipeWire source, so any
 //! application can record from it while playback stays on A2DP.
 //!
-//! Tuning knobs live in `~/.config/librepods/mic.conf` (or
-//! `$XDG_CONFIG_HOME/librepods/mic.conf`) and are re-read about once a second,
-//! so they can be changed while the app is running:
+//! Tuning knobs are shared through the global `TUNING`. They can be changed
+//! live from the AirPods page in the app (which also saves them), or by
+//! editing `~/.config/librepods/mic.conf` (or
+//! `$XDG_CONFIG_HOME/librepods/mic.conf`), which is re-read about once a
+//! second:
 //!
 //!   max_queue_ms = 200   # hard cap on buffered audio; older audio is dropped
 //!   prebuffer_ms = 60    # audio collected before playback (re)starts
 //!   gain         = 3.0   # linear volume multiplier, clipped at full scale
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use pipewire as pw;
 use pw::properties::properties;
 use pw::spa;
@@ -22,61 +24,48 @@ use std::time::{Duration, Instant, SystemTime};
 
 const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 
-const DEFAULT_MAX_QUEUE_MS: u32 = 200;
-const DEFAULT_PREBUFFER_MS: u32 = 60;
-const DEFAULT_GAIN_MILLI: u32 = 3000;
+pub const DEFAULT_MAX_QUEUE_MS: u32 = 200;
+pub const DEFAULT_PREBUFFER_MS: u32 = 60;
+pub const DEFAULT_GAIN_MILLI: u32 = 3000;
 
 /// PipeWire scheduling quantum, in ms. Override with LIBREPODS_MIC_QUANTUM_MS
 /// (read once when the node is created).
 const DEFAULT_QUANTUM_MS: u32 = 20;
 
-const DEFAULT_CONFIG: &str = "# LibrePods microphone tuning. Re-read about once a second.\n\
-# Keep max_queue_ms at least twice prebuffer_ms.\n\
-#\n\
-# Hard cap on buffered audio. Raise it if the log shows many overruns.\n\
-max_queue_ms = 200\n\
-# Audio collected before playback starts or resumes after a gap.\n\
-# Higher = fewer dropouts, more delay.\n\
-prebuffer_ms = 60\n\
-# Linear volume multiplier (1.0 = unchanged).\n\
-gain = 3.0\n";
-
 enum Command {
     Quit,
 }
 
-struct Tuning {
-    max_queue_ms: AtomicU32,
-    prebuffer_ms: AtomicU32,
-    gain_milli: AtomicU32,
+/// Live-adjustable microphone settings, read by the audio threads on every
+/// cycle and written by the UI.
+pub struct Tuning {
+    pub max_queue_ms: AtomicU32,
+    pub prebuffer_ms: AtomicU32,
+    pub gain_milli: AtomicU32,
 }
 
-/// State shared between the decoder thread and the PipeWire thread.
-struct Shared {
-    queue: Mutex<VecDeque<i16>>,
-    /// True only while an application is actually recording from the node.
-    streaming: AtomicBool,
-    /// False while the jitter buffer is refilling after start or an underrun.
-    playing: AtomicBool,
-    tuning: Tuning,
-    /// Samples per second across all channels.
-    samples_per_sec: usize,
-    underruns: AtomicU64,
-    overruns: AtomicU64,
+pub static TUNING: Tuning = Tuning {
+    max_queue_ms: AtomicU32::new(DEFAULT_MAX_QUEUE_MS),
+    prebuffer_ms: AtomicU32::new(DEFAULT_PREBUFFER_MS),
+    gain_milli: AtomicU32::new(DEFAULT_GAIN_MILLI),
+};
+
+pub fn set_max_queue_ms(value: u32) {
+    TUNING
+        .max_queue_ms
+        .store(value.clamp(20, 2000), Ordering::Relaxed);
+    save_tuning();
 }
 
-struct Housekeeping {
-    path: Option<PathBuf>,
-    mtime: Option<SystemTime>,
-    last_check: Instant,
-    last_stats: Instant,
+pub fn set_prebuffer_ms(value: u32) {
+    TUNING.prebuffer_ms.store(value.min(1000), Ordering::Relaxed);
+    save_tuning();
 }
 
-pub struct MicSource {
-    shared: Arc<Shared>,
-    housekeeping: Mutex<Housekeeping>,
-    sender: pw::channel::Sender<Command>,
-    thread: Option<std::thread::JoinHandle<()>>,
+pub fn set_gain(value: f32) {
+    let milli = (value.clamp(0.1, 16.0) * 1000.0).round() as u32;
+    TUNING.gain_milli.store(milli, Ordering::Relaxed);
+    save_tuning();
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -87,7 +76,37 @@ fn config_path() -> Option<PathBuf> {
     Some(base.join("librepods").join("mic.conf"))
 }
 
-fn apply_config(tuning: &Tuning, text: &str) {
+fn render_config() -> String {
+    format!(
+        "# LibrePods microphone tuning. Also editable in the app; re-read about once a second.\n\
+# Keep max_queue_ms at least twice prebuffer_ms.\n\
+# Hard cap on buffered audio. Raise it if the log shows many overruns.\n\
+max_queue_ms = {}\n\
+# Audio collected before playback starts or resumes after a gap.\n\
+# Higher = fewer dropouts, more delay.\n\
+prebuffer_ms = {}\n\
+# Linear volume multiplier (1.0 = unchanged).\n\
+gain = {:.2}\n",
+        TUNING.max_queue_ms.load(Ordering::Relaxed),
+        TUNING.prebuffer_ms.load(Ordering::Relaxed),
+        TUNING.gain_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+    )
+}
+
+/// Persists the current settings so they survive a restart.
+pub fn save_tuning() {
+    let Some(path) = config_path() else {
+        return;
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Err(e) = std::fs::write(&path, render_config()) {
+        warn!("Could not save {}: {e}", path.display());
+    }
+}
+
+fn apply_config(text: &str) {
     let mut max_ms = DEFAULT_MAX_QUEUE_MS;
     let mut pre_ms = DEFAULT_PREBUFFER_MS;
     let mut gain = DEFAULT_GAIN_MILLI as f64 / 1000.0;
@@ -113,13 +132,39 @@ fn apply_config(tuning: &Tuning, text: &str) {
             other => warn!("mic.conf: unknown key {other:?}"),
         }
     }
-    pre_ms = pre_ms.min(max_ms);
-    tuning.max_queue_ms.store(max_ms, Ordering::Relaxed);
-    tuning.prebuffer_ms.store(pre_ms, Ordering::Relaxed);
-    tuning
+    TUNING.max_queue_ms.store(max_ms, Ordering::Relaxed);
+    TUNING.prebuffer_ms.store(pre_ms, Ordering::Relaxed);
+    TUNING
         .gain_milli
         .store((gain * 1000.0).round() as u32, Ordering::Relaxed);
-    info!("Mic tuning: max_queue_ms={max_ms} prebuffer_ms={pre_ms} gain={gain:.2}");
+    debug!("Mic tuning: max_queue_ms={max_ms} prebuffer_ms={pre_ms} gain={gain:.2}");
+}
+
+/// State shared between the decoder thread and the PipeWire thread.
+struct Shared {
+    queue: Mutex<VecDeque<i16>>,
+    /// True only while an application is actually recording from the node.
+    streaming: AtomicBool,
+    /// False while the jitter buffer is refilling after start or an underrun.
+    playing: AtomicBool,
+    /// Samples per second across all channels.
+    samples_per_sec: usize,
+    underruns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+struct Housekeeping {
+    path: Option<PathBuf>,
+    mtime: Option<SystemTime>,
+    last_check: Instant,
+    last_stats: Instant,
+}
+
+pub struct MicSource {
+    shared: Arc<Shared>,
+    housekeeping: Mutex<Housekeeping>,
+    sender: pw::channel::Sender<Command>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MicSource {
@@ -129,11 +174,6 @@ impl MicSource {
             queue: Mutex::new(VecDeque::new()),
             streaming: AtomicBool::new(false),
             playing: AtomicBool::new(false),
-            tuning: Tuning {
-                max_queue_ms: AtomicU32::new(DEFAULT_MAX_QUEUE_MS),
-                prebuffer_ms: AtomicU32::new(DEFAULT_PREBUFFER_MS),
-                gain_milli: AtomicU32::new(DEFAULT_GAIN_MILLI),
-            },
             samples_per_sec: rate as usize * channels as usize,
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
@@ -143,19 +183,22 @@ impl MicSource {
         let mut mtime = None;
         if let Some(p) = &path {
             if !p.exists() {
-                if let Some(dir) = p.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                let _ = std::fs::write(p, DEFAULT_CONFIG);
+                save_tuning();
             }
             match std::fs::read_to_string(p) {
                 Ok(text) => {
-                    apply_config(&shared.tuning, &text);
+                    apply_config(&text);
                     mtime = std::fs::metadata(p).and_then(|m| m.modified()).ok();
                 }
                 Err(e) => warn!("Could not read {}: {e}", p.display()),
             }
-            info!("Edit {} to tune the microphone live", p.display());
+            info!(
+                "Mic tuning: max_queue_ms={} prebuffer_ms={} gain={:.2} ({})",
+                TUNING.max_queue_ms.load(Ordering::Relaxed),
+                TUNING.prebuffer_ms.load(Ordering::Relaxed),
+                TUNING.gain_milli.load(Ordering::Relaxed) as f64 / 1000.0,
+                p.display()
+            );
         }
 
         let (sender, receiver) = pw::channel::channel();
@@ -194,7 +237,7 @@ impl MicSource {
                 if modified.is_some() && modified != hk.mtime {
                     hk.mtime = modified;
                     match std::fs::read_to_string(&path) {
-                        Ok(text) => apply_config(&self.shared.tuning, &text),
+                        Ok(text) => apply_config(&text),
                         Err(e) => warn!("Could not read {}: {e}", path.display()),
                     }
                 }
@@ -219,7 +262,7 @@ impl MicSource {
             return;
         }
         let max_samples = self.shared.samples_per_sec
-            * self.shared.tuning.max_queue_ms.load(Ordering::Relaxed) as usize
+            * TUNING.max_queue_ms.load(Ordering::Relaxed) as usize
             / 1000;
         let Ok(mut queue) = self.shared.queue.lock() else {
             return;
@@ -321,10 +364,12 @@ fn run(
             };
             let wanted = frames * channel_count;
 
-            let gain = shared.tuning.gain_milli.load(Ordering::Relaxed) as i64;
-            let prebuffer = shared.samples_per_sec
-                * shared.tuning.prebuffer_ms.load(Ordering::Relaxed) as usize
-                / 1000;
+            let gain = TUNING.gain_milli.load(Ordering::Relaxed) as i64;
+            let prebuffer_ms = TUNING
+                .prebuffer_ms
+                .load(Ordering::Relaxed)
+                .min(TUNING.max_queue_ms.load(Ordering::Relaxed));
+            let prebuffer = shared.samples_per_sec * prebuffer_ms as usize / 1000;
 
             let mut written = 0;
             if let Ok(mut queue) = shared.queue.lock() {

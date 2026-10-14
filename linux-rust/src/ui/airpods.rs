@@ -7,6 +7,8 @@ use iced::widget::rule::FillMode;
 use iced::widget::{
     Space, button, column, combo_box, container, row, rule, text, text_input, toggler,
 };
+#[cfg(feature = "mic")]
+use iced::widget::slider;
 use iced::{Background, Border, Center, Color, Length, Padding, Theme};
 use log::error;
 use std::collections::HashMap;
@@ -362,6 +364,8 @@ pub fn airpods_view<'a>(
             )
     };
 
+    let mic_settings_col = mic_settings_view(&mac, state);
+
     let mut information_col = column![];
     if let Some(device) = devices_list.get(mac_information.as_str()) {
         if let Some(DeviceInformation::AirPods(ref airpods_info)) = device.information {
@@ -515,12 +519,151 @@ pub fn airpods_view<'a>(
         audio_settings_col,
         Space::new().height(Length::from(20)),
         off_listening_mode_toggle,
+        mic_settings_col,
         Space::new().height(Length::from(20)),
         information_col
     ])
     .padding(20)
     .center_x(Length::Fill)
     .height(Length::Fill)
+}
+
+/// Sliders for the live microphone settings. Each change updates the shared
+/// tuning (picked up by the audio thread immediately) and saves it. The
+/// StateChanged message only exists to make the window redraw.
+#[cfg(feature = "mic")]
+fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Column<'a, Message> {
+    use crate::audio::source::{self, TUNING};
+    use std::sync::atomic::Ordering;
+
+    let max_ms = TUNING.max_queue_ms.load(Ordering::Relaxed);
+    let pre_ms = TUNING.prebuffer_ms.load(Ordering::Relaxed);
+    let gain = TUNING.gain_milli.load(Ordering::Relaxed) as f32 / 1000.0;
+
+    let refresh = {
+        let mac = mac.to_string();
+        let state = state.clone();
+        move || Message::StateChanged(mac.clone(), DeviceState::AirPods(state.clone()))
+    };
+
+    let on_pre = refresh.clone();
+    let prebuffer_slider = slider(0.0..=300.0, pre_ms as f32, move |v: f32| {
+        source::set_prebuffer_ms(v as u32);
+        on_pre()
+    })
+    .step(5.0);
+
+    let on_max = refresh.clone();
+    let max_queue_slider = slider(40.0..=1000.0, max_ms as f32, move |v: f32| {
+        source::set_max_queue_ms(v as u32);
+        on_max()
+    })
+    .step(10.0);
+
+    let on_gain = refresh;
+    let gain_slider = slider(0.5..=8.0, gain, move |v: f32| {
+        source::set_gain(v);
+        on_gain()
+    })
+    .step(0.1);
+
+    let body = column![
+        mic_row(
+            "Prebuffer",
+            "Audio collected before playback starts or resumes after a gap. Higher means fewer dropouts but more delay.",
+            format!("{pre_ms} ms"),
+            prebuffer_slider.into(),
+        ),
+        rule::horizontal(1).style(|theme: &Theme| {
+            rule::Style {
+                color: theme.palette().text.scale_alpha(0.2),
+                radius: Radius::from(12),
+                fill_mode: FillMode::Full,
+                snap: false,
+            }
+        }),
+        mic_row(
+            "Max Queue",
+            "Most audio kept waiting. Older audio is dropped past this. Keep it at least twice the prebuffer.",
+            format!("{max_ms} ms"),
+            max_queue_slider.into(),
+        ),
+        rule::horizontal(1).style(|theme: &Theme| {
+            rule::Style {
+                color: theme.palette().text.scale_alpha(0.2),
+                radius: Radius::from(12),
+                fill_mode: FillMode::Full,
+                snap: false,
+            }
+        }),
+        mic_row(
+            "Gain",
+            "Microphone volume multiplier. Raise it if the mic is quiet; lower it if it distorts.",
+            format!("{gain:.1}x"),
+            gain_slider.into(),
+        ),
+    ]
+    .spacing(8)
+    .padding(8);
+
+    column![
+        Space::new().height(Length::from(20)),
+        container(text("Microphone").size(18).style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().primary);
+            style
+        }))
+        .padding(Padding {
+            top: 5.0,
+            bottom: 5.0,
+            left: 18.0,
+            right: 18.0,
+        }),
+        container(body)
+            .padding(Padding {
+                top: 5.0,
+                bottom: 5.0,
+                left: 10.0,
+                right: 10.0,
+            })
+            .style(|theme: &Theme| {
+                let mut style = container::Style::default();
+                style.background = Some(Background::Color(theme.palette().primary.scale_alpha(0.1)));
+                let mut border = Border::default();
+                border.color = theme.palette().primary.scale_alpha(0.5);
+                style.border = border.rounded(16);
+                style
+            })
+    ]
+}
+
+#[cfg(feature = "mic")]
+fn mic_row<'a>(
+    title: &'static str,
+    description: &'static str,
+    value: String,
+    control: iced::Element<'a, Message>,
+) -> iced::Element<'a, Message> {
+    column![
+        row![
+            text(title).size(16),
+            Space::new().width(Length::Fill),
+            text(value).size(16),
+        ],
+        text(description).size(12).style(|theme: &Theme| {
+            let mut style = text::Style::default();
+            style.color = Some(theme.palette().text.scale_alpha(0.7));
+            style
+        }),
+        control,
+    ]
+    .spacing(4)
+    .into()
+}
+
+#[cfg(not(feature = "mic"))]
+fn mic_settings_view<'a>(_mac: &str, _state: &AirPodsState) -> iced::widget::Column<'a, Message> {
+    column![]
 }
 
 fn run_async_in_thread<F>(fut: F)
