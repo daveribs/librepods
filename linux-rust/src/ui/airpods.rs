@@ -5,7 +5,7 @@ use iced::overlay::menu;
 use iced::widget::button::Style;
 use iced::widget::rule::FillMode;
 use iced::widget::{
-    Space, button, column, combo_box, container, row, rule, text, text_input, toggler,
+    Space, button, column, combo_box, container, row, rule, scrollable, text, text_input, toggler,
 };
 #[cfg(feature = "mic")]
 use iced::widget::slider;
@@ -511,29 +511,45 @@ pub fn airpods_view<'a>(
         }
     }
 
-    container(column![
-        rename_input,
-        Space::new().height(Length::from(20)),
-        listening_mode,
-        Space::new().height(Length::from(20)),
-        audio_settings_col,
-        Space::new().height(Length::from(20)),
-        off_listening_mode_toggle,
-        mic_settings_col,
-        Space::new().height(Length::from(20)),
-        information_col
-    ])
+    container(
+        scrollable(
+            column![
+                rename_input,
+                Space::new().height(Length::from(20)),
+                listening_mode,
+                Space::new().height(Length::from(20)),
+                audio_settings_col,
+                Space::new().height(Length::from(20)),
+                off_listening_mode_toggle,
+                mic_settings_col,
+                Space::new().height(Length::from(20)),
+                information_col
+            ]
+            .width(Length::Fill)
+            .padding(Padding {
+                top: 0.0,
+                bottom: 0.0,
+                left: 0.0,
+                right: 12.0,
+            }),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
     .padding(20)
     .center_x(Length::Fill)
     .height(Length::Fill)
 }
 
 /// Sliders for the live microphone settings. Each change updates the shared
-/// tuning (picked up by the audio thread immediately) and saves it. The
-/// StateChanged message only exists to make the window redraw.
+/// tuning (picked up by the audio thread immediately) and saves it. Ctrl+click
+/// on a slider resets it to its default. The StateChanged message only exists
+/// to make the window redraw.
 #[cfg(feature = "mic")]
 fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Column<'a, Message> {
-    use crate::audio::source::{self, TUNING};
+    use crate::audio::source::{
+        self, DEFAULT_GAIN_MILLI, DEFAULT_MAX_QUEUE_MS, DEFAULT_PREBUFFER_MS, TUNING,
+    };
     use std::sync::atomic::Ordering;
 
     let max_ms = TUNING.max_queue_ms.load(Ordering::Relaxed);
@@ -551,6 +567,7 @@ fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Colum
         source::set_prebuffer_ms(v as u32);
         on_pre()
     })
+    .default(DEFAULT_PREBUFFER_MS as f32)
     .step(5.0);
 
     let on_max = refresh.clone();
@@ -558,6 +575,7 @@ fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Colum
         source::set_max_queue_ms(v as u32);
         on_max()
     })
+    .default(DEFAULT_MAX_QUEUE_MS as f32)
     .step(10.0);
 
     let on_gain = refresh;
@@ -565,12 +583,13 @@ fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Colum
         source::set_gain(v);
         on_gain()
     })
+    .default(DEFAULT_GAIN_MILLI as f32 / 1000.0)
     .step(0.1);
 
     let body = column![
         mic_row(
             "Prebuffer",
-            "Audio collected before playback starts or resumes after a gap. Higher means fewer dropouts but more delay.",
+            "Audio collected before playback starts or resumes after a gap. Higher means fewer dropouts but more delay. Ctrl+click resets.",
             format!("{pre_ms} ms"),
             prebuffer_slider.into(),
         ),
@@ -584,7 +603,7 @@ fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Colum
         }),
         mic_row(
             "Max Queue",
-            "Most audio kept waiting. Older audio is dropped past this. Keep it at least twice the prebuffer.",
+            "Most audio kept waiting. Older audio is dropped past this. Keep it at least twice the prebuffer. Ctrl+click resets.",
             format!("{max_ms} ms"),
             max_queue_slider.into(),
         ),
@@ -598,7 +617,7 @@ fn mic_settings_view<'a>(mac: &str, state: &AirPodsState) -> iced::widget::Colum
         }),
         mic_row(
             "Gain",
-            "Microphone volume multiplier. Raise it if the mic is quiet; lower it if it distorts.",
+            "Microphone volume multiplier. Raise it if the mic is quiet; lower it if it distorts. Ctrl+click resets.",
             format!("{gain:.1}x"),
             gain_slider.into(),
         ),
