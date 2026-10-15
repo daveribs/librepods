@@ -7,9 +7,12 @@
 //! `$XDG_CONFIG_HOME/librepods/mic.conf`), which is re-read about once a
 //! second:
 //!
-//!   max_queue_ms = 200   # hard cap on buffered audio; older audio is dropped
-//!   prebuffer_ms = 60    # audio collected before playback (re)starts
+//!   max_queue_ms = 200   # ceiling: above this, the backlog is cut back to prebuffer_ms
+//!   prebuffer_ms = 60    # target delay: refill level at start/after a gap, and the level the backlog is held to
 //!   gain         = 3.0   # linear volume multiplier, clipped at full scale
+//!
+//! Changes apply immediately: raising the prebuffer re-buffers up to the new
+//! level (one short gap), lowering it trims the backlog down to the new level.
 
 use log::{debug, error, info, warn};
 use pipewire as pw;
@@ -68,6 +71,14 @@ pub fn set_gain(value: f32) {
     save_tuning();
 }
 
+/// Prebuffer in ms, never above the max queue.
+fn effective_prebuffer_ms() -> u32 {
+    TUNING
+        .prebuffer_ms
+        .load(Ordering::Relaxed)
+        .min(TUNING.max_queue_ms.load(Ordering::Relaxed))
+}
+
 fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -80,10 +91,10 @@ fn render_config() -> String {
     format!(
         "# LibrePods microphone tuning. Also editable in the app; re-read about once a second.\n\
 # Keep max_queue_ms at least twice prebuffer_ms.\n\
-# Hard cap on buffered audio. Raise it if the log shows many overruns.\n\
+# Ceiling on buffered audio: above this the backlog is cut back to prebuffer_ms.\n\
 max_queue_ms = {}\n\
-# Audio collected before playback starts or resumes after a gap.\n\
-# Higher = fewer dropouts, more delay.\n\
+# Target delay: audio collected before playback starts or resumes, and the level\n\
+# the backlog is held to. Higher = fewer dropouts, more delay.\n\
 prebuffer_ms = {}\n\
 # Linear volume multiplier (1.0 = unchanged).\n\
 gain = {:.2}\n",
@@ -147,6 +158,8 @@ struct Shared {
     streaming: AtomicBool,
     /// False while the jitter buffer is refilling after start or an underrun.
     playing: AtomicBool,
+    /// Prebuffer (ms) the audio thread last acted on, to detect live changes.
+    applied_prebuffer_ms: AtomicU32,
     /// Samples per second across all channels.
     samples_per_sec: usize,
     underruns: AtomicU64,
@@ -174,6 +187,7 @@ impl MicSource {
             queue: Mutex::new(VecDeque::new()),
             streaming: AtomicBool::new(false),
             playing: AtomicBool::new(false),
+            applied_prebuffer_ms: AtomicU32::new(0),
             samples_per_sec: rate as usize * channels as usize,
             underruns: AtomicU64::new(0),
             overruns: AtomicU64::new(0),
@@ -250,7 +264,11 @@ impl MicSource {
                 let ms = queued * 1000 / self.shared.samples_per_sec.max(1);
                 let under = self.shared.underruns.swap(0, Ordering::Relaxed);
                 let over = self.shared.overruns.swap(0, Ordering::Relaxed);
-                info!("Mic buffer: {ms} ms queued, {under} underruns, {over} overruns (last 2 s)");
+                info!(
+                    "Mic buffer: {ms} ms queued (target {} ms, ceiling {} ms), {under} underruns, {over} trims (last 2 s)",
+                    effective_prebuffer_ms(),
+                    TUNING.max_queue_ms.load(Ordering::Relaxed)
+                );
             }
         }
     }
@@ -264,14 +282,18 @@ impl MicSource {
         let max_samples = self.shared.samples_per_sec
             * TUNING.max_queue_ms.load(Ordering::Relaxed) as usize
             / 1000;
+        let target_samples =
+            (self.shared.samples_per_sec * effective_prebuffer_ms() as usize / 1000)
+                .max(pcm.len());
         let Ok(mut queue) = self.shared.queue.lock() else {
             return;
         };
         queue.extend(pcm.iter().copied());
         if queue.len() > max_samples {
-            // The reader fell behind. Dropping the oldest audio keeps latency
-            // bounded.
-            let excess = queue.len() - max_samples;
+            // The backlog crossed the ceiling (a Bluetooth burst, or the reader
+            // stalled). Drop the oldest audio and land at the prebuffer level,
+            // not at the ceiling, so the delay returns to its target.
+            let excess = queue.len().saturating_sub(target_samples);
             queue.drain(..excess);
             self.shared.overruns.fetch_add(1, Ordering::Relaxed);
         }
@@ -365,14 +387,23 @@ fn run(
             let wanted = frames * channel_count;
 
             let gain = TUNING.gain_milli.load(Ordering::Relaxed) as i64;
-            let prebuffer_ms = TUNING
-                .prebuffer_ms
-                .load(Ordering::Relaxed)
-                .min(TUNING.max_queue_ms.load(Ordering::Relaxed));
+            let prebuffer_ms = effective_prebuffer_ms();
             let prebuffer = shared.samples_per_sec * prebuffer_ms as usize / 1000;
+            let previous_ms = shared.applied_prebuffer_ms.swap(prebuffer_ms, Ordering::Relaxed);
 
             let mut written = 0;
             if let Ok(mut queue) = shared.queue.lock() {
+                if prebuffer_ms != previous_ms && shared.playing.load(Ordering::Relaxed) {
+                    if prebuffer_ms > previous_ms {
+                        // Raised live: pause output until the larger level is
+                        // buffered (one short gap), so the new delay takes hold.
+                        shared.playing.store(false, Ordering::Relaxed);
+                    } else if queue.len() > prebuffer {
+                        // Lowered live: drop the surplus so the delay shrinks now.
+                        let excess = queue.len() - prebuffer;
+                        queue.drain(..excess);
+                    }
+                }
                 if !shared.playing.load(Ordering::Relaxed) && queue.len() >= prebuffer.max(wanted)
                 {
                     shared.playing.store(true, Ordering::Relaxed);
